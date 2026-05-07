@@ -1,0 +1,50 @@
+# --- Hassas / yerel konfigürasyon ---
+ustunturson/includes/config/config.local.php
+*.env
+.env
+.env.local
+
+# --- macOS / IDE / editör ---
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Log / hata dosyaları ---
+*.log
+error_log
+**/error_log
+ustunturson/error_log
+
+# --- Yedek / arşiv dosyaları ---
+*.bak
+*.old
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+yedek/
+backup/
+
+# --- Ara / eski DB dump'ları (sadece db_ustun_FULL.sql tutulur) ---
+db_ustun_schema.sql
+db_ustun_seed.sql
+db_ustun_fix.sql
+db_ustun_content.sql
+ustuntur.sql
+db_ustuntur.sql
+
+# --- Bağımlılık klasörleri (ileride kullanılırsa) ---
+node_modules/
+vendor/
+composer.lock
+
+# --- ACME / SSL doğrulama (sunucuya özel) ---
+ustunturson/.well-known/
+
+# --- Apache özel cache ---
+.htaccess.bak
