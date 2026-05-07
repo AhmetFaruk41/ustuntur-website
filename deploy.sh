@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 #
-# Üstün Tur deploy script
+# Üstün Tur deploy script (Nginx + PHP-FPM)
 # Kullanım: sudo bash deploy.sh
 #
 # Sıfırdan kurulumu da yarım kalan kurulumu da tamamlar (idempotent).
-# DB var mı, config var mı, vhost var mı kontrol eder; yoksa oluşturur.
 
 set -euo pipefail
 
 # ============================================================
-# Ayarlar — gerekirse değiştir
+# Ayarlar
 # ============================================================
 DOMAIN="ustuntur.com.tr"
 SITE_DIR="/var/www/${DOMAIN}"
@@ -19,11 +18,14 @@ DB_NAME="db_ustun"
 DB_USER="usr_ustun"
 DB_PASS="Ustun2019!"
 
+PHP_VERSION="8.2"
+PHP_SOCK="/var/run/php/php${PHP_VERSION}-fpm.sock"
+
 ADMIN_EMAIL="info@ustuntur.com.tr"
 
-# Opsiyonel — set edilirse uygulanır
-NEW_ADMIN_PASS=""        # boş bırakılırsa admin paroli değiştirilmez
-RUN_CERTBOT="1"          # 1 ise Let's Encrypt çalıştırılır (DNS yayılmışsa)
+# Opsiyonel
+NEW_ADMIN_PASS=""        # boş bırakılırsa admin parolası değiştirilmez
+RUN_CERTBOT="1"          # 1 ise Let's Encrypt çalıştırılır
 
 # ============================================================
 
@@ -54,7 +56,6 @@ if [[ "$DB_EXISTS" -eq 0 ]]; then
   ok "DB ve kullanıcı oluşturuldu"
 else
   ok "DB zaten mevcut"
-  # Kullanıcı yoksa yine de oluştur
   mysql -u root -e "
     CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
     GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
@@ -67,7 +68,7 @@ fi
 # ============================================================
 log "Tablolar kontrol ediliyor..."
 TABLE_COUNT=$(mysql -u "$DB_USER" -p"$DB_PASS" -N -B -e \
-  "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';")
+  "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${DB_NAME}';" 2>/dev/null)
 if [[ "$TABLE_COUNT" -eq 0 ]]; then
   log "Tablo yok, dump import ediliyor..."
   mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "${SITE_DIR}/db_ustun_FULL.sql"
@@ -105,40 +106,73 @@ find "${WEBROOT}/images" "${WEBROOT}/upload" -type d -exec chmod 775 {} \; 2>/de
 ok "İzinler ayarlandı"
 
 # ============================================================
-# 5) Apache vhost
+# 5) Nginx server block
 # ============================================================
-VHOST_FILE="/etc/apache2/sites-available/${DOMAIN}.conf"
-if [[ ! -f "$VHOST_FILE" ]]; then
-  log "Apache vhost yazılıyor..."
-  cat > "$VHOST_FILE" <<CONF
-<VirtualHost *:80>
-    ServerName ${DOMAIN}
-    ServerAlias www.${DOMAIN}
-    DocumentRoot ${WEBROOT}
+NGINX_FILE="/etc/nginx/sites-available/${DOMAIN}"
+log "Nginx server block yazılıyor..."
+cat > "$NGINX_FILE" <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN} www.${DOMAIN};
 
-    <Directory ${WEBROOT}>
-        Options -Indexes +FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
+    root ${WEBROOT};
+    index index.php index.html;
 
-    ErrorLog \${APACHE_LOG_DIR}/ustuntur_error.log
-    CustomLog \${APACHE_LOG_DIR}/ustuntur_access.log combined
-</VirtualHost>
-CONF
-  ok "vhost yazıldı: $VHOST_FILE"
-else
-  ok "vhost zaten var"
-fi
+    access_log /var/log/nginx/ustuntur_access.log;
+    error_log  /var/log/nginx/ustuntur_error.log;
 
-a2enmod rewrite >/dev/null
-a2ensite "${DOMAIN}" >/dev/null
-a2dissite 000-default >/dev/null 2>&1 || true
+    client_max_body_size 50M;
 
-log "Apache config test..."
-apache2ctl configtest
-systemctl reload apache2
-ok "Apache reload edildi"
+    # Bilinmeyen URL'ler router.php'ye gider (.htaccess rewrite kurallarını PHP'de simüle eder)
+    location / {
+        try_files \$uri \$uri/ /router.php?\$query_string;
+    }
+
+    # PHP dosyaları PHP-FPM'e gönderilir
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${PHP_SOCK};
+        fastcgi_read_timeout 120;
+    }
+
+    # Hassas dosya/dizin erişimini engelle
+    location ~ /\.(ht|git) {
+        deny all;
+    }
+    location ~ ^/(includes/config|\.well-known/acme-challenge) {
+        # config klasörü erişime kapalı
+    }
+    location = /includes/config/config.local.php { deny all; }
+    location ~ ^/includes/config/ { deny all; }
+
+    # Statik dosyalar için cache
+    location ~* \.(jpg|jpeg|png|gif|webp|svg|ico|css|js|woff|woff2|ttf|otf|eot|mp4|webm|ogg)\$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+        try_files \$uri =404;
+    }
+
+    # Gzip
+    gzip on;
+    gzip_vary on;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/xml+rss application/atom+xml image/svg+xml;
+}
+NGINX
+ok "Nginx config yazıldı: $NGINX_FILE"
+
+# Site enable + default disable
+ln -sf "$NGINX_FILE" "/etc/nginx/sites-enabled/${DOMAIN}"
+[[ -L /etc/nginx/sites-enabled/default ]] && rm /etc/nginx/sites-enabled/default
+
+log "Nginx config test..."
+nginx -t
+systemctl reload nginx
+ok "Nginx reload edildi"
+
+# PHP-FPM restart (config değişikliklerinin tutması için)
+systemctl reload "php${PHP_VERSION}-fpm"
 
 # ============================================================
 # 6) Üretim ayarları (DB)
@@ -154,25 +188,26 @@ mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
 ok "site_url, captcha, smtp_durum ayarlandı"
 
 if [[ -n "$NEW_ADMIN_PASS" ]]; then
-  log "Admin paroli güncelleniyor..."
+  log "Admin parolası güncelleniyor..."
   mysql -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e \
     "UPDATE yonetici SET pass_sifre=MD5('${NEW_ADMIN_PASS}') WHERE user_adi='admin';" 2>/dev/null
-  ok "Admin paroli değiştirildi"
+  ok "Admin parolası değiştirildi"
 fi
 
 # ============================================================
-# 7) SSL (Let's Encrypt)
+# 7) SSL (Let's Encrypt — Nginx plugin)
 # ============================================================
 if [[ "$RUN_CERTBOT" == "1" ]]; then
   if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     ok "SSL sertifikası zaten mevcut"
   else
     log "Let's Encrypt sertifikası alınıyor..."
-    if certbot --apache -d "${DOMAIN}" -d "www.${DOMAIN}" \
+    if command -v certbot >/dev/null && certbot --nginx -d "${DOMAIN}" -d "www.${DOMAIN}" \
          --redirect --agree-tos -m "${ADMIN_EMAIL}" --non-interactive; then
       ok "SSL kuruldu, HTTP→HTTPS redirect aktif"
     else
-      warn "SSL alınamadı (DNS henüz yayılmamış olabilir). Sonra elle: certbot --apache -d ${DOMAIN} -d www.${DOMAIN}"
+      warn "SSL alınamadı. DNS henüz yayılmamış veya certbot kurulu değil olabilir."
+      warn "Sonra elle: apt install -y certbot python3-certbot-nginx && certbot --nginx -d ${DOMAIN} -d www.${DOMAIN}"
     fi
   fi
 fi
